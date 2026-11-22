@@ -43,11 +43,15 @@ Controles:
     Mouse               -> apuntar (los disparos son automáticos)
     Clic o teclas 1-2-3 -> elegir mejora (las tarjetas salen en la ventana principal)
     P                   -> pausa
-    ESPACIO / clic      -> reiniciar después de perder
+    M                   -> silenciar / activar el sonido
+    Clic en JUGAR       -> empezar (el menú muestra el récord, que se guarda entre sesiones)
+    ESPACIO / clic      -> volver al menú después de perder
     ESC                 -> salir
 """
+import array
 import collections
 import math
+import os
 import random
 import sys
 
@@ -222,6 +226,29 @@ TARJETA_HOVER = (50, 60, 100)
 BORDE_VENTANA = (45, 55, 85)
 
 
+ARCHIVO_RECORD = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+                              "ShooterVentanas", "record.txt")
+
+
+def cargar_record():
+    """Lee el mejor tiempo guardado (0 si todavía no hay o el archivo no se puede leer)."""
+    try:
+        with open(ARCHIVO_RECORD, encoding="utf-8") as f:
+            return max(0.0, float(f.read().strip()))
+    except (OSError, ValueError):
+        return 0.0
+
+
+def guardar_record(segundos):
+    """Guarda el mejor tiempo para que se mantenga al cerrar el juego."""
+    try:
+        os.makedirs(os.path.dirname(ARCHIVO_RECORD), exist_ok=True)
+        with open(ARCHIVO_RECORD, "w", encoding="utf-8") as f:
+            f.write(f"{segundos:.1f}")
+    except OSError:
+        pass  # sin permiso de escritura: el récord solo dura esta sesión
+
+
 def rotar_puntos(puntos, angulo, centro):
     """Rota una lista de puntos (relativos al origen) y los traslada a `centro`."""
     return [centro + pygame.Vector2(p).rotate(angulo) for p in puntos]
@@ -238,6 +265,198 @@ def partir_texto(fuente, texto, ancho):
             lineas.append(actual)
             actual = palabra
     return lineas + [actual] if actual else lineas
+
+
+# --- Sonido ------------------------------------------------------------------
+# Todos los sonidos se generan con código al arrancar (síntesis estilo
+# arcade): no hace falta ningún archivo externo.
+
+ONDAS = {
+    "seno": lambda f: math.sin(2 * math.pi * f),
+    "cuadrada": lambda f: 1.0 if f < 0.5 else -1.0,
+    "triangulo": lambda f: 4 * abs(f - 0.5) - 1,
+    "sierra": lambda f: 2 * f - 1,
+}
+
+
+class Sonidos:
+    """Sintetiza los efectos de sonido y los reproduce sin saturar.
+
+    Cada sonido es una lista de muestras armada con `tono`, `secuencia` y
+    `mezclar`. Los que pueden sonar muchas veces por segundo (disparos,
+    impactos, muertes) tienen un intervalo mínimo entre reproducciones.
+    Si no hay placa de sonido, el juego sigue andando en silencio.
+    """
+
+    # Intervalo mínimo en milisegundos entre dos reproducciones del mismo sonido
+    INTERVALOS = {"disparo": 55, "impacto": 35, "critico": 40, "perforar": 60, "rebote": 45,
+                  "division": 60, "muerte": 30, "muerte_grande": 60, "reaccion": 45,
+                  "disparo_enemigo": 70, "elite": 200, "hover": 40}
+
+    def __init__(self):
+        """Inicia el mezclador y sintetiza todos los sonidos (si hay audio disponible)."""
+        self.sonidos = {}
+        self.ultimo = {}
+        self.silencio = False
+        try:
+            if not pygame.mixer.get_init():
+                pygame.mixer.init(22050, -16, 1, 512)
+            self.frecuencia, _, self.canales = pygame.mixer.get_init()
+            pygame.mixer.set_num_channels(32)
+        except pygame.error:
+            return  # sin audio: todos los play() no hacen nada
+        for nombre, (muestras, volumen) in self.definir().items():
+            self.sonidos[nombre] = self.crear(muestras, volumen)
+
+    # Bloques para armar sonidos -------------------------------------------------
+
+    def tono(self, dur, f0=0, f1=None, onda="cuadrada", ruido=0.0, filtro=1.0,
+             ataque=0.004, curva=2.0, vibrato=0.0):
+        """Una nota que barre de f0 a f1 Hz, con ruido opcional y volumen que se apaga.
+
+        `ruido` mezcla ruido blanco (0 a 1) suavizado por `filtro` (más bajo =
+        más grave, tipo explosión). `curva` controla qué tan rápido se apaga.
+        """
+        n = max(1, int(self.frecuencia * dur))
+        f = f0
+        paso = (f1 / f0) ** (1 / n) if f0 and f1 else 1.0
+        generar = ONDAS[onda]
+        fase = suave = 0.0
+        muestras = []
+        for i in range(n):
+            t = i / n
+            fv = f * (1 + 0.04 * math.sin(2 * math.pi * vibrato * i / self.frecuencia)) if vibrato else f
+            fase = (fase + fv / self.frecuencia) % 1.0
+            s = generar(fase) * (1 - ruido) if f0 else 0.0
+            if ruido:
+                suave += filtro * (random.uniform(-1, 1) - suave)
+                s += suave * ruido * (1 / max(filtro, 0.15)) ** 0.5
+            env = min(1.0, i / (ataque * self.frecuencia + 1)) * (1 - t) ** curva
+            muestras.append(s * env)
+            f *= paso
+        return muestras
+
+    def silencio_de(self, dur):
+        """Un tramo sin sonido de `dur` segundos."""
+        return [0.0] * int(self.frecuencia * dur)
+
+    @staticmethod
+    def secuencia(*partes):
+        """Pega varios sonidos uno detrás del otro."""
+        return [m for parte in partes for m in parte]
+
+    @staticmethod
+    def mezclar(*partes):
+        """Suma varios sonidos que empiezan al mismo tiempo."""
+        largo = max(len(p) for p in partes)
+        total = [0.0] * largo
+        for parte in partes:
+            for i, m in enumerate(parte):
+                total[i] += m
+        return total
+
+    def notas(self, frecuencias, dur, onda="cuadrada", curva=1.5):
+        """Arpegio: una nota corta por cada frecuencia."""
+        return self.secuencia(*(self.tono(dur, f, onda=onda, curva=curva) for f in frecuencias))
+
+    def crear(self, muestras, volumen):
+        """Normaliza las muestras al `volumen` pedido y las convierte en un pygame.mixer.Sound."""
+        pico = max(1e-6, max(abs(m) for m in muestras))
+        escala = 32767 * volumen / pico
+        enteros = [int(m * escala) for m in muestras]
+        if self.canales == 2:
+            enteros = [m for m in enteros for _ in range(2)]
+        return pygame.mixer.Sound(buffer=array.array("h", enteros).tobytes())
+
+    def definir(self):
+        """Receta de cada sonido del juego: nombre -> (muestras, volumen de 0 a 1)."""
+        t, sec, mez, notas, sil = self.tono, self.secuencia, self.mezclar, self.notas, self.silencio_de
+        DO, MI, SOL, DO2, MI2, SOL2 = 523, 659, 784, 1047, 1319, 1568
+        return {
+            # Nave
+            "disparo": (t(0.05, 950, 520, curva=3), 0.07),
+            "golpe": (t(0.3, 420, 70, "sierra", ruido=0.35, filtro=0.5), 0.5),
+            "alerta_vida": (sec(t(0.09, 140, 110, "seno"), sil(0.07), t(0.12, 120, 90, "seno")), 0.55),
+            "escudo_rompe": (mez(t(0.5, 1600, 180, "seno", curva=1.5),
+                                 t(0.55, ruido=1.0, filtro=0.12, curva=1.5)), 0.5),
+            "escudo_recarga": (notas([700, 930, 1240], 0.07, "seno"), 0.3),
+            "vacio_entra": (t(0.22, 520, 160, "seno", curva=1), 0.16),
+            "vacio_sale": (t(0.22, 160, 520, "seno", curva=1), 0.16),
+            "game_over": (sec(notas([440, 392, 330], 0.16, "triangulo", curva=0.8),
+                              t(0.7, 220, 110, "triangulo", vibrato=6, curva=1.2)), 0.45),
+            "record": (sec(notas([DO, MI, SOL], 0.09), t(0.45, DO2, onda="cuadrada", vibrato=5, curva=1)), 0.3),
+            # Balas del jugador
+            "impacto": (t(0.04, 240, 120, "triangulo", ruido=0.3, curva=2.5), 0.18),
+            "critico": (mez(t(0.09, 1400, 1900, curva=2.5), t(0.06, ruido=1.0, filtro=0.9)), 0.22),
+            "perforar": (t(0.05, 650, 1300, "seno"), 0.1),
+            "rebote": (t(0.08, 750, 1500, "triangulo"), 0.16),
+            "division": (sec(t(0.035, 1000, onda="seno"), t(0.05, 1400, onda="seno")), 0.13),
+            # Enemigos
+            "muerte": (t(0.17, 320, 60, ruido=0.7, filtro=0.45), 0.26),
+            "muerte_grande": (t(0.4, 170, 40, ruido=0.8, filtro=0.22, curva=1.6), 0.42),
+            "muerte_elite": (mez(t(0.25, 300, 60, ruido=0.7, filtro=0.4),
+                                 notas([SOL2, DO2 * 2, MI2 * 2], 0.06, "seno")), 0.38),
+            "divisor_parte": (mez(t(0.15, 300, 80, ruido=0.6, filtro=0.4),
+                                  sec(t(0.06, 500, onda="cuadrada"), t(0.08, 900, onda="cuadrada"))), 0.28),
+            "disparo_enemigo": (t(0.09, 420, 240, "sierra"), 0.11),
+            "elite": (sec(t(0.05, 1500, onda="seno"), t(0.07, 2000, onda="seno")), 0.14),
+            "kamikaze_alerta": (sec(t(0.05, 1250), sil(0.03), t(0.05, 1250), sil(0.03), t(0.07, 1650)), 0.28),
+            "kamikaze_boom": (mez(t(0.55, 130, 30, ruido=0.9, filtro=0.18, curva=1.4),
+                                  t(0.12, ruido=1.0, filtro=0.8)), 0.6),
+            "franco_apunta": (t(1.1, 300, 1100, "seno", ataque=0.05, curva=0.25), 0.16),
+            "franco_fija": (sec(t(0.04, 1800), sil(0.03), t(0.04, 1800)), 0.22),
+            "franco_disparo": (mez(t(0.2, 2200, 160, "sierra"), t(0.1, ruido=1.0, filtro=0.7)), 0.35),
+            "reaccion": (t(0.24, 210, 50, ruido=0.85, filtro=0.3), 0.3),
+            # Jefe
+            "jefe_aparece": (mez(t(1.3, 72, 55, "sierra", vibrato=4, ataque=0.15, curva=1.2),
+                                 t(1.3, 108, 82, "sierra", vibrato=4, ataque=0.15, curva=1.2)), 0.45),
+            "latido": (t(0.14, 65, 45, "seno", curva=1.5), 0.4),
+            "escoltas": (t(0.6, 280, 620, "cuadrada", vibrato=9, curva=1), 0.2),
+            "jefe_muere": (mez(t(1.5, 110, 25, ruido=0.9, filtro=0.1, curva=1.3),
+                               sec(sil(0.25), notas([SOL, MI, DO, SOL / 2], 0.12, "triangulo"))), 0.65),
+            # Mejoras y ventanas
+            "nivel": (notas([DO, MI, SOL, DO2], 0.065), 0.28),
+            "hover": (t(0.025, 1100, onda="seno"), 0.09),
+            "mejora_comun": (notas([MI, SOL], 0.08, "triangulo"), 0.3),
+            "mejora_rara": (notas([MI, SOL, DO2], 0.08, "triangulo"), 0.32),
+            "mejora_legendaria": (mez(notas([DO, MI, SOL, DO2, MI2], 0.07, "triangulo"),
+                                      sec(sil(0.28), t(0.4, MI2, onda="seno", vibrato=6, curva=1))), 0.36),
+            "mejora_mitica": (sec(notas([DO, MI, SOL, DO2, MI2, SOL2], 0.06),
+                                  mez(t(0.7, DO2, onda="cuadrada", vibrato=5, curva=1),
+                                      t(0.7, MI2, onda="cuadrada", vibrato=5, curva=1),
+                                      t(0.7, SOL2, onda="cuadrada", vibrato=5, curva=1))), 0.38),
+            "ventana_abre": (t(0.4, 180, 1300, "seno", ruido=0.35, filtro=0.25, curva=1), 0.3),
+            # Interfaz
+            "cuenta": (t(0.1, 660), 0.22),
+            "go": (t(0.28, 990, curva=1.2), 0.26),
+            "pausa": (sec(t(0.06, 700, onda="triangulo"), t(0.09, 470, onda="triangulo")), 0.25),
+            "inicio": (notas([330, 440, 660], 0.07, "triangulo"), 0.28),
+            "silencio": (t(0.05, 800, onda="seno"), 0.2),
+        }
+
+    def play(self, nombre):
+        """Reproduce un sonido, salvo que esté silenciado o haya sonado hace muy poco."""
+        sonido = self.sonidos.get(nombre)
+        if sonido is None or self.silencio:
+            return
+        ahora = pygame.time.get_ticks()
+        if ahora - self.ultimo.get(nombre, -10_000) < self.INTERVALOS.get(nombre, 0):
+            return
+        self.ultimo[nombre] = ahora
+        sonido.play()
+
+    def detener_todo(self):
+        """Corta todos los sonidos que se estén reproduciendo."""
+        if self.sonidos:
+            pygame.mixer.stop()
+
+    def alternar_silencio(self):
+        """Activa o desactiva todos los sonidos (tecla M)."""
+        self.silencio = not self.silencio
+        if self.silencio:
+            self.detener_todo()
+        else:
+            self.play("silencio")
 
 
 # Todas las posiciones del juego están en coordenadas del ESCRITORIO (el
@@ -695,9 +914,12 @@ class Juego:
 
         pos = ((ancho_esc - TAM_PRINCIPAL[0]) // 2, (alto_esc - TAM_PRINCIPAL[1]) // 2)
         self.vistas = [Vista("Shooter - ventanas", TAM_PRINCIPAL, pos, principal=True)]
-        self.mejor_tiempo = 0.0  # récord de la sesión (se mantiene entre partidas)
+        self.mejor_tiempo = cargar_record()  # récord guardado de partidas anteriores
         self.sin_foco = 0
+        self.boton_hover = False
+        self.sonido = Sonidos()
         self.reiniciar()
+        self.estado = "menu"  # el juego espera a que se toque JUGAR
 
     @property
     def principal(self):
@@ -727,7 +949,11 @@ class Juego:
         self.nivel = 1
         self.xp = 0
         self.opciones = []          # mejoras ofrecidas mientras el estado es "mejora"
+        self.tarjeta_hover = None   # tarjeta bajo el mouse (para el sonido al pasar por encima)
+        self.en_vacio = False       # si la nave está en el vacío entre ventanas
+        self.frames_jefe = 0        # para el latido mientras hay un jefe vivo
         self.estado = "jugando"
+        self.sonido.play("inicio")
 
     # --- Ventanas ----------------------------------------------------------------
 
@@ -772,6 +998,7 @@ class Juego:
         pos = self.posicion_libre(TAM_EXTRA)
         if pos is not None:
             self.vistas.append(Vista("Shooter - ventana extra", TAM_EXTRA, pos, principal=False))
+            self.sonido.play("ventana_abre")
 
     def revisar_foco(self):
         """Pausa solo si el juego perdió el foco del teclado durante varios frames seguidos.
@@ -785,6 +1012,7 @@ class Juego:
         self.sin_foco += 1
         if self.sin_foco >= FRAMES_SIN_FOCO and self.estado in ("jugando", "cuenta"):
             self.estado = "pausa"
+            self.sonido.play("pausa")
 
     # --- Experiencia y mejoras -------------------------------------------------
 
@@ -833,6 +1061,8 @@ class Juego:
         random.shuffle(self.opciones)
         if self.opciones:
             self.estado = "mejora"
+            self.tarjeta_hover = None
+            self.sonido.play("nivel")
 
     def mejora_disponible(self, mejora):
         """Indica si una mejora todavía se puede elegir (no llegó a su tope ni le faltan requisitos)."""
@@ -889,6 +1119,7 @@ class Juego:
     def aplicar_mejora(self, mejora):
         """Aplica la mejora elegida y vuelve al juego (o encadena otra subida de nivel)."""
         j = self.jugador
+        self.sonido.play("mejora_" + self.rareza(mejora))  # suena según su rareza
         self.niveles[mejora] += 1
         if mejora == "cadencia":
             j.cadencia = max(CADENCIA_MINIMA, j.cadencia * FACTOR_CADENCIA)
@@ -942,17 +1173,56 @@ class Juego:
                 self.aplicar_mejora(mejora)
                 return
 
+    # --- Menú inicial -----------------------------------------------------------
+
+    def rect_boton(self):
+        """Rectángulo del botón JUGAR, en coordenadas de la ventana principal."""
+        ancho_v, alto_v = self.principal.ventana.size
+        return pygame.Rect(ancho_v // 2 - 90, alto_v // 2 + 10, 180, 50)
+
+    def clic_menu(self):
+        """Si el clic cayó sobre el botón JUGAR, arranca la partida."""
+        if self.rect_boton().collidepoint(self.mouse_en_principal()):
+            self.empezar_partida()
+
+    def volver_al_menu(self):
+        """Después del game over: cierra las ventanas extra y muestra el menú."""
+        self.reiniciar()
+        self.estado = "menu"
+
+    def empezar_partida(self):
+        """Deja todo como nuevo y arranca con la cuenta regresiva."""
+        self.reiniciar()
+        self.iniciar_cuenta()
+
+    def revisar_hover_menu(self):
+        """Hace un "tic" cuando el mouse entra al botón JUGAR."""
+        encima = self.rect_boton().collidepoint(self.mouse_en_principal())
+        if encima and not self.boton_hover:
+            self.sonido.play("hover")
+        self.boton_hover = encima
+
+    def revisar_hover(self):
+        """Hace un "tic" cada vez que el mouse pasa a otra tarjeta de mejora."""
+        pos = self.mouse_en_principal()
+        actual = next((i for i, r in enumerate(self.rects_tarjetas()) if r.collidepoint(pos)), None)
+        if actual is not None and actual != self.tarjeta_hover:
+            self.sonido.play("hover")
+        self.tarjeta_hover = actual
+
     # --- Pausa y cuenta regresiva ----------------------------------------------
 
     def iniciar_cuenta(self):
         """Arranca la cuenta regresiva de 3 segundos antes de volver a jugar."""
         self.cuenta = CUENTA_REGRESIVA
         self.estado = "cuenta"
+        self.sonido.play("cuenta")
 
     def alternar_pausa(self):
         """Pausa el juego, o si ya estaba pausado arranca la cuenta regresiva para seguir."""
         if self.estado in ("jugando", "cuenta"):
             self.estado = "pausa"
+            self.sonido.play("pausa")
         elif self.estado == "pausa":
             self.iniciar_cuenta()
 
@@ -1014,10 +1284,14 @@ class Juego:
         enemigo = Enemigo(tipo, self.posicion_entrada(datos["radio"]), self.fuerza(), dispara, elite)
         enemigo.velocidad *= self.factor_velocidad()
         self.enemigos.append(enemigo)
+        if elite:
+            self.sonido.play("elite")
         if tipo == "jefe":
             self.jefes_aparecidos += 1
+            self.sonido.play("jefe_aparece")
             if self.jefes_aparecidos >= ESCOLTAS_DESDE_JEFE:
                 self.generar_escoltas(enemigo)
+                self.sonido.play("escoltas")
         return enemigo
 
     def generar_escoltas(self, jefe):
@@ -1058,6 +1332,16 @@ class Juego:
         self.xp_pendiente += e.xp * (PENALIZACION_XP_JEFE if penalizado else 1)
         self.explotar(e.pos, ELITE_COLOR if e.elite else e.color, 60 if e.jefe else 14)
         if e.jefe:
+            self.sonido.play("jefe_muere")
+        elif e.elite:
+            self.sonido.play("muerte_elite")
+        elif e.tipo == "divisor":
+            self.sonido.play("divisor_parte")
+        elif e.tipo in ("tanque", "escolta"):
+            self.sonido.play("muerte_grande")
+        else:
+            self.sonido.play("muerte")
+        if e.jefe:
             self.jefes_derrotados += 1
         if e.tipo == "divisor":
             costado = (e.vel.rotate(90).normalize() if e.vel.length_squared() > 0.01
@@ -1080,6 +1364,7 @@ class Juego:
         radio = self.radio_reaccion()
         while self.explosiones:
             pos = self.explosiones.pop()
+            self.sonido.play("reaccion")
             self.ondas.append(Onda(pos, radio, REACCION_COLOR, duracion=16, radio_inicial=6))
             for e in list(self.enemigos):
                 if e.vida > 0 and e.pos.distance_to(pos) < radio + e.radio:
@@ -1089,6 +1374,7 @@ class Juego:
     def explotar_kamikaze(self, e):
         """Explosión de un kamikaze: daña a la nave si está dentro del radio."""
         e.vida = 0
+        self.sonido.play("kamikaze_boom")
         self.ondas.append(Onda(e.pos, KAMIKAZE_RADIO, KAMIKAZE_EXPLOSION, duracion=18, radio_inicial=8))
         self.explotar(e.pos, e.color, 20)
         if e.pos.distance_to(self.jugador.pos) < KAMIKAZE_RADIO + Jugador.RADIO:
@@ -1107,9 +1393,12 @@ class Juego:
         if random.random() < CRITICO_POR_NIVEL * self.niveles["critico"]:
             danio = 2
             self.explotar(b.pos, CRITICO_COLOR, 5)
+            self.sonido.play("critico")
         mato = e.recibir_disparo(danio)
         if mato:
             self.destruir_enemigo(e)
+        elif danio == 1:
+            self.sonido.play("impacto")
         b.golpeados.add(e)
 
         # División: si la bala mató, las nuevas balas recuperan todas sus divisiones
@@ -1124,9 +1413,11 @@ class Juego:
                                 divisiones=restantes)
                     hija.golpeados = set(b.golpeados)
                     self.balas.append(hija)
+                self.sonido.play("division")
 
         if b.perforaciones > 0:
             b.perforaciones -= 1
+            self.sonido.play("perforar")
             return True
         if b.rebotes > 0:
             objetivo = self.enemigo_cercano(b.pos, excluir=b.golpeados, alcance=REBOTE_ALCANCE)
@@ -1135,6 +1426,7 @@ class Juego:
                 direccion = objetivo.pos - b.pos
                 if direccion.length_squared() > 0.01:
                     b.vel = direccion.normalize() * VEL_BALA
+                    self.sonido.play("rebote")
                     return True
         return False
 
@@ -1145,9 +1437,13 @@ class Juego:
         """
         resultado = self.jugador.recibir_golpe()
         if resultado == "escudo":
+            self.sonido.play("escudo_rompe")
             self.explosion_escudo()
         elif resultado == "vida":
             self.explotar(self.jugador.pos, JUGADOR_COLOR, 8)
+            self.sonido.play("golpe")
+            if self.jugador.vidas == 1:
+                self.sonido.play("alerta_vida")  # latido: queda la última vida
         return resultado is not None
 
     def explosion_escudo(self):
@@ -1175,15 +1471,27 @@ class Juego:
             self.cuenta -= 1
             if self.cuenta <= 0:
                 self.estado = "jugando"
+                self.sonido.play("go")
+            elif self.cuenta % FPS == 0:
+                self.sonido.play("cuenta")
             return  # durante la cuenta regresiva todo queda congelado
         self.particulas = [p for p in self.particulas if not p.actualizar()]
         self.ondas = [o for o in self.ondas if not o.actualizar()]
+        if self.estado == "mejora":
+            self.revisar_hover()
+        elif self.estado == "menu":
+            self.revisar_hover_menu()
         if self.estado != "jugando":
             return
         self.xp_pendiente = 0.0
 
-        # El cronómetro solo avanza si no hay un jefe vivo
-        if not self.jefe_vivo:
+        # El cronómetro solo avanza si no hay un jefe vivo (mientras vive, suena un latido)
+        if self.jefe_vivo:
+            self.frames_jefe += 1
+            if self.frames_jefe % FPS == 0:
+                self.sonido.play("latido")
+        else:
+            self.frames_jefe = 0
             self.tiempo += 1 / FPS
             if self.tiempo >= self.proximo_jefe:
                 self.generar_enemigo("jefe")
@@ -1194,7 +1502,14 @@ class Juego:
         mouse = pygame.mouse.get_pos(desktop=True)  # en coordenadas del escritorio
         jugador.actualizar(pygame.key.get_pressed(), mouse, self.mundo)
         if len(self.balas) < MAX_BALAS:
-            self.balas += jugador.disparar()  # disparo automático y constante
+            nuevas = jugador.disparar()  # disparo automático y constante
+            if nuevas:
+                self.balas += nuevas
+                self.sonido.play("disparo")
+        en_vacio = not self.visible(jugador.pos)
+        if en_vacio != self.en_vacio:
+            self.sonido.play("vacio_entra" if en_vacio else "vacio_sale")
+            self.en_vacio = en_vacio
         self.balas = [b for b in self.balas if not b.actualizar(self.mundo)]
         self.balas_enemigas = [b for b in self.balas_enemigas if not b.actualizar(self.mundo)]
 
@@ -1208,12 +1523,20 @@ class Juego:
         for e in list(self.enemigos):
             if e.vida <= 0:
                 continue
+            mecha_antes = e.mecha
             if e.actualizar(jugador.pos):  # un kamikaze terminó su mecha
                 self.explotar_kamikaze(e)
                 continue
+            if mecha_antes is None and e.mecha is not None and self.visible(e.pos):
+                self.sonido.play("kamikaze_alerta")  # fijó tu posición y se lanza
             bala = e.intentar_disparo(jugador.pos, self.visible(e.pos))
             if bala:
                 self.balas_enemigas.append(bala)
+                self.sonido.play("franco_disparo" if e.tipo == "francotirador" else "disparo_enemigo")
+            elif e.apuntando == FRANCO_APUNTE:
+                self.sonido.play("franco_apunta")  # empieza a mostrar la línea
+            elif e.apuntando == FRANCO_FIJA:
+                self.sonido.play("franco_fija")    # la línea quedó fija: ¡a moverse!
 
         # Balas del jugador contra enemigos (también en el vacío entre ventanas)
         for b in list(self.balas):
@@ -1231,6 +1554,7 @@ class Juego:
                 if self.golpear_jugador() and not e.resiste_choque and e.vida > 0:
                     e.vida = 0
                     self.explotar(e.pos, e.color)
+                    self.sonido.play("kamikaze_boom" if e.tipo == "kamikaze" else "muerte")
         for b in self.balas_enemigas[:]:
             if b.pos.distance_to(jugador.pos) < b.radio + Jugador.RADIO:
                 self.balas_enemigas.remove(b)
@@ -1242,7 +1566,11 @@ class Juego:
             self.explotar(jugador.pos, JUGADOR_COLOR, 40)
             self.estado = "fin"
             self.nuevo_record = self.tiempo > self.mejor_tiempo
-            self.mejor_tiempo = max(self.mejor_tiempo, self.tiempo)
+            if self.nuevo_record:
+                self.mejor_tiempo = self.tiempo
+                guardar_record(self.mejor_tiempo)
+            self.sonido.detener_todo()  # que el final se escuche limpio
+            self.sonido.play("record" if self.nuevo_record else "game_over")
         elif self.xp_pendiente:
             self.ganar_xp(self.xp_pendiente)
 
@@ -1257,6 +1585,7 @@ class Juego:
             self.progreso_recarga = 0
             self.jugador.escudo += 1
             self.explotar(self.jugador.pos, ESCUDO_COLOR, 10)
+            self.sonido.play("escudo_recarga")
 
     # --- Dibujo ----------------------------------------------------------------
 
@@ -1284,7 +1613,7 @@ class Juego:
                         cosa.dibujar(p, o)
             for onda in self.ondas:
                 onda.dibujar(p, o)
-            if self.estado != "fin":
+            if self.estado not in ("fin", "menu"):
                 self.jugador.dibujar(p, o)
                 if not nave_visible:
                     self.dibujar_indicador(p, rect)
@@ -1295,7 +1624,7 @@ class Juego:
             else:
                 pygame.draw.rect(p, BORDE_VENTANA, p.get_rect(), 1)
 
-            if vista.principal:
+            if vista.principal and self.estado != "menu":
                 self.dibujar_hud(p)
             self.dibujar_carteles(p, vista.principal)
             vista.ventana.flip()
@@ -1323,7 +1652,10 @@ class Juego:
         principal; las demás solo se oscurecen.
         """
         centro = (p.get_width() // 2, p.get_height() // 2)
-        if self.estado == "pausa":
+        if self.estado == "menu":
+            if es_principal:
+                self.dibujar_menu(p, centro)
+        elif self.estado == "pausa":
             self.oscurecer(p)
             self.texto(p, "PAUSA", centro, self.fuente_grande)
             self.texto(p, "P para continuar", (centro[0], centro[1] + 34), color=GRIS)
@@ -1348,7 +1680,27 @@ class Juego:
                            (centro[0], centro[1] + 8), color=GRIS)
             self.texto(p, f"Nivel {self.nivel}   Ventanas {len(self.vistas)}",
                        (centro[0], centro[1] + 32), self.fuente_chica)
-            self.texto(p, "ESPACIO o clic para reiniciar", (centro[0], centro[1] + 62), color=GRIS)
+            self.texto(p, "ESPACIO o clic para volver al menú", (centro[0], centro[1] + 62), color=GRIS)
+
+    def dibujar_menu(self, p, centro):
+        """Pantalla inicial: título, récord guardado, botón JUGAR y controles."""
+        cx, cy = centro
+        self.texto(p, "SHOOTER", (cx, cy - 100), self.fuente_grande, JUGADOR_COLOR)
+        self.texto(p, "VENTANAS", (cx, cy - 68), self.fuente, XP_COLOR)
+        if self.mejor_tiempo:
+            self.texto(p, f"Récord: {self.formato_tiempo(self.mejor_tiempo)}", (cx, cy - 25),
+                       color=ELITE_COLOR)
+        else:
+            self.texto(p, "Todavía no hay récord", (cx, cy - 25), color=GRIS)
+
+        boton = self.rect_boton()
+        encima = boton.collidepoint(self.mouse_en_principal())
+        pygame.draw.rect(p, TARJETA_HOVER if encima else TARJETA, boton, border_radius=10)
+        pygame.draw.rect(p, BLANCO if encima else XP_COLOR, boton, 2, border_radius=10)
+        self.texto(p, "JUGAR", boton.center, self.fuente_grande if encima else self.fuente)
+
+        controles = "WASD mover  ·  mouse apuntar  ·  P pausa  ·  M sonido  ·  ESC salir"
+        self.texto(p, controles, (cx, boton.bottom + 40), self.fuente_chica, GRIS)
 
     def dibujar_mejoras(self, p):
         """Dibuja las tarjetas de mejora con el color de su rareza; la del mouse se resalta."""
@@ -1449,6 +1801,7 @@ class Juego:
 
 def main():
     """Bucle principal: procesa eventos, actualiza el juego y dibuja todas las ventanas."""
+    pygame.mixer.pre_init(22050, -16, 1, 512)  # audio liviano y con poca latencia
     pygame.init()
     juego = Juego()
     reloj = pygame.time.Clock()
@@ -1461,6 +1814,8 @@ def main():
                 sys.exit()
             if e.type == pygame.KEYDOWN and e.key == pygame.K_p:
                 juego.alternar_pausa()
+            if e.type == pygame.KEYDOWN and e.key == pygame.K_m:
+                juego.sonido.alternar_silencio()
 
             if juego.estado == "mejora":
                 if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
@@ -1469,10 +1824,15 @@ def main():
                     indice = e.key - pygame.K_1
                     if indice < len(juego.opciones):
                         juego.aplicar_mejora(juego.opciones[indice])
+            elif juego.estado == "menu":
+                if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
+                    juego.clic_menu()
+                elif e.type == pygame.KEYDOWN and e.key in (pygame.K_RETURN, pygame.K_SPACE):
+                    juego.empezar_partida()
             elif juego.estado == "fin":
                 if e.type == pygame.MOUSEBUTTONDOWN or (
                         e.type == pygame.KEYDOWN and e.key == pygame.K_SPACE):
-                    juego.reiniciar()
+                    juego.volver_al_menu()
 
         juego.revisar_foco()
         juego.actualizar()
