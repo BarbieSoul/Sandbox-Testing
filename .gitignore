@@ -1,2 +1,8 @@
 __pycache__/
 *.pyc
+
+# Salida de PyInstaller (ejecutables compilados)
+build/
+dist/
+*.spec
+*.exe
