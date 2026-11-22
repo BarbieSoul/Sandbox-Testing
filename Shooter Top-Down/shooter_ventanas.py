@@ -1,5 +1,5 @@
 """
-Shooter top-down multiventana (pygame-ce).
+Window Shooter: shooter top-down multiventana (pygame-ce).
 
 El escenario es TODO el monitor. Cada ventana del juego es un "agujero" por
 el que se ve una parte de ese escenario. Al principio hay una sola ventana;
@@ -45,6 +45,7 @@ Controles:
     P                   -> pausa
     M                   -> silenciar / activar el sonido
     Clic en JUGAR       -> empezar (el menú muestra el récord, que se guarda entre sesiones)
+    Barra de volumen    -> arrastrarla, rueda del mouse o flechas ← → en el menú
     ESPACIO / clic      -> volver al menú después de perder
     ESC                 -> salir
 """
@@ -226,27 +227,60 @@ TARJETA_HOVER = (50, 60, 100)
 BORDE_VENTANA = (45, 55, 85)
 
 
-ARCHIVO_RECORD = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
-                              "ShooterVentanas", "record.txt")
+TITULO = "Window Shooter"
+VOLUMEN_INICIAL = 0.7
+
+# Récord y volumen se guardan fuera del juego, así se mantienen al cerrarlo
+CARPETA_DATOS = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+                             "ShooterVentanas")
+ARCHIVO_RECORD = os.path.join(CARPETA_DATOS, "record.txt")
+ARCHIVO_VOLUMEN = os.path.join(CARPETA_DATOS, "volumen.txt")
+
+
+def cargar_numero(archivo, defecto, minimo=0.0, maximo=float("inf")):
+    """Lee un número guardado en `archivo` (o `defecto` si no existe o no se puede leer)."""
+    try:
+        with open(archivo, encoding="utf-8") as f:
+            return min(maximo, max(minimo, float(f.read().strip())))
+    except (OSError, ValueError):
+        return defecto
+
+
+def guardar_numero(archivo, valor):
+    """Guarda un número en `archivo` (si no hay permiso, simplemente no se guarda)."""
+    try:
+        os.makedirs(os.path.dirname(archivo), exist_ok=True)
+        with open(archivo, "w", encoding="utf-8") as f:
+            f.write(f"{valor:.2f}")
+    except OSError:
+        pass
 
 
 def cargar_record():
-    """Lee el mejor tiempo guardado (0 si todavía no hay o el archivo no se puede leer)."""
-    try:
-        with open(ARCHIVO_RECORD, encoding="utf-8") as f:
-            return max(0.0, float(f.read().strip()))
-    except (OSError, ValueError):
-        return 0.0
+    """Mejor tiempo guardado (0 si todavía no hay)."""
+    return cargar_numero(ARCHIVO_RECORD, 0.0)
 
 
 def guardar_record(segundos):
     """Guarda el mejor tiempo para que se mantenga al cerrar el juego."""
+    guardar_numero(ARCHIVO_RECORD, segundos)
+
+
+ICONO = None  # se carga en main() desde image.ico
+
+
+def ruta_recurso(nombre):
+    """Ruta de un archivo que viaja con el juego (en el .exe, PyInstaller lo extrae a _MEIPASS)."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, nombre)
+
+
+def cargar_icono():
+    """Lee image.ico para el ícono de las ventanas (None si no está o no se puede leer)."""
     try:
-        os.makedirs(os.path.dirname(ARCHIVO_RECORD), exist_ok=True)
-        with open(ARCHIVO_RECORD, "w", encoding="utf-8") as f:
-            f.write(f"{segundos:.1f}")
-    except OSError:
-        pass  # sin permiso de escritura: el récord solo dura esta sesión
+        return pygame.image.load(ruta_recurso("image.ico"))
+    except (pygame.error, FileNotFoundError):
+        return None
 
 
 def rotar_puntos(puntos, angulo, centro):
@@ -298,6 +332,7 @@ class Sonidos:
         self.sonidos = {}
         self.ultimo = {}
         self.silencio = False
+        self.volumen = cargar_numero(ARCHIVO_VOLUMEN, VOLUMEN_INICIAL, 0.0, 1.0)
         try:
             if not pygame.mixer.get_init():
                 pygame.mixer.init(22050, -16, 1, 512)
@@ -307,6 +342,17 @@ class Sonidos:
             return  # sin audio: todos los play() no hacen nada
         for nombre, (muestras, volumen) in self.definir().items():
             self.sonidos[nombre] = self.crear(muestras, volumen)
+        self.cambiar_volumen(self.volumen)
+
+    def cambiar_volumen(self, volumen):
+        """Ajusta el volumen general (0 a 1) de todos los sonidos."""
+        self.volumen = min(1.0, max(0.0, volumen))
+        for sonido in self.sonidos.values():
+            sonido.set_volume(self.volumen)
+
+    def guardar_volumen(self):
+        """Guarda el volumen elegido para la próxima vez que se abra el juego."""
+        guardar_numero(ARCHIVO_VOLUMEN, self.volumen)
 
     # Bloques para armar sonidos -------------------------------------------------
 
@@ -870,6 +916,8 @@ class Vista:
         """Abre la ventana con el tamaño y la posición (en el escritorio) indicados."""
         extras = {} if principal else {"borderless": True, "always_on_top": True}
         self.ventana = pygame.Window(titulo, tam, position=pos, **extras)
+        if ICONO is not None:
+            self.ventana.set_icon(ICONO)
         self.principal = principal
         self.nueva = 0 if principal else DURACION_NUEVA  # frames de resaltado al aparecer
 
@@ -913,7 +961,8 @@ class Juego:
                            random.randint(60, 200)) for _ in range(cantidad)]
 
         pos = ((ancho_esc - TAM_PRINCIPAL[0]) // 2, (alto_esc - TAM_PRINCIPAL[1]) // 2)
-        self.vistas = [Vista("Shooter - ventanas", TAM_PRINCIPAL, pos, principal=True)]
+        self.vistas = [Vista(TITULO, TAM_PRINCIPAL, pos, principal=True)]
+        self.arrastrando_volumen = False
         self.mejor_tiempo = cargar_record()  # récord guardado de partidas anteriores
         self.sin_foco = 0
         self.boton_hover = False
@@ -997,7 +1046,7 @@ class Juego:
         """Abre una ventana extra en un lugar libre cerca de la principal (si hay lugar)."""
         pos = self.posicion_libre(TAM_EXTRA)
         if pos is not None:
-            self.vistas.append(Vista("Shooter - ventana extra", TAM_EXTRA, pos, principal=False))
+            self.vistas.append(Vista(TITULO, TAM_EXTRA, pos, principal=False))
             self.sonido.play("ventana_abre")
 
     def revisar_foco(self):
@@ -1178,12 +1227,40 @@ class Juego:
     def rect_boton(self):
         """Rectángulo del botón JUGAR, en coordenadas de la ventana principal."""
         ancho_v, alto_v = self.principal.ventana.size
-        return pygame.Rect(ancho_v // 2 - 90, alto_v // 2 + 10, 180, 50)
+        return pygame.Rect(ancho_v // 2 - 90, alto_v // 2 - 22, 180, 50)
+
+    def rect_volumen(self):
+        """Riel de la barra de volumen (debajo del botón JUGAR)."""
+        boton = self.rect_boton()
+        return pygame.Rect(boton.left + 10, boton.bottom + 48, boton.width - 20, 8)
 
     def clic_menu(self):
-        """Si el clic cayó sobre el botón JUGAR, arranca la partida."""
-        if self.rect_boton().collidepoint(self.mouse_en_principal()):
+        """Clic en el menú: JUGAR arranca la partida; en la barra empieza a mover el volumen."""
+        pos = self.mouse_en_principal()
+        if self.rect_boton().collidepoint(pos):
             self.empezar_partida()
+        elif self.rect_volumen().inflate(24, 24).collidepoint(pos):
+            self.arrastrando_volumen = True
+            self.mover_volumen()
+
+    def mover_volumen(self):
+        """Pone el volumen según la posición horizontal del mouse sobre la barra."""
+        barra = self.rect_volumen()
+        x = self.mouse_en_principal()[0]
+        self.sonido.cambiar_volumen((x - barra.left) / barra.width)
+
+    def soltar_volumen(self):
+        """Al soltar la barra: guarda el volumen y hace sonar una muestra para escucharlo."""
+        if self.arrastrando_volumen:
+            self.arrastrando_volumen = False
+            self.sonido.guardar_volumen()
+            self.sonido.play("nivel")
+
+    def ajustar_volumen(self, paso):
+        """Sube o baja el volumen con las flechas (de a 10%)."""
+        self.sonido.cambiar_volumen(round(self.sonido.volumen + paso, 2))
+        self.sonido.guardar_volumen()
+        self.sonido.play("hover")
 
     def volver_al_menu(self):
         """Después del game over: cierra las ventanas extra y muestra el menú."""
@@ -1685,22 +1762,43 @@ class Juego:
     def dibujar_menu(self, p, centro):
         """Pantalla inicial: título, récord guardado, botón JUGAR y controles."""
         cx, cy = centro
-        self.texto(p, "SHOOTER", (cx, cy - 100), self.fuente_grande, JUGADOR_COLOR)
-        self.texto(p, "VENTANAS", (cx, cy - 68), self.fuente, XP_COLOR)
+        self.texto(p, "WINDOW", (cx, cy - 135), self.fuente, XP_COLOR)
+        self.texto(p, "SHOOTER", (cx, cy - 105), self.fuente_grande, JUGADOR_COLOR)
         if self.mejor_tiempo:
-            self.texto(p, f"Récord: {self.formato_tiempo(self.mejor_tiempo)}", (cx, cy - 25),
+            self.texto(p, f"Récord: {self.formato_tiempo(self.mejor_tiempo)}", (cx, cy - 60),
                        color=ELITE_COLOR)
         else:
-            self.texto(p, "Todavía no hay récord", (cx, cy - 25), color=GRIS)
+            self.texto(p, "Todavía no hay récord", (cx, cy - 60), color=GRIS)
 
+        mouse = self.mouse_en_principal()
         boton = self.rect_boton()
-        encima = boton.collidepoint(self.mouse_en_principal())
+        encima = boton.collidepoint(mouse)
         pygame.draw.rect(p, TARJETA_HOVER if encima else TARJETA, boton, border_radius=10)
         pygame.draw.rect(p, BLANCO if encima else XP_COLOR, boton, 2, border_radius=10)
         self.texto(p, "JUGAR", boton.center, self.fuente_grande if encima else self.fuente)
 
+        # Barra de volumen: riel, parte llena y una perilla que se arrastra
+        barra = self.rect_volumen()
+        volumen = self.sonido.volumen
+        silenciado = self.sonido.silencio or not self.sonido.sonidos
+        if silenciado:
+            etiqueta = "Volumen: silenciado (M)" if self.sonido.sonidos else "Sin audio disponible"
+        else:
+            etiqueta = f"Volumen: {round(volumen * 100)}%"
+        self.texto(p, etiqueta, (cx, barra.top - 16), self.fuente_media, GRIS if silenciado else BLANCO)
+        activa = self.arrastrando_volumen or barra.inflate(24, 24).collidepoint(mouse)
+        pygame.draw.rect(p, (30, 40, 60), barra, border_radius=4)
+        lleno = barra.copy()
+        lleno.width = round(barra.width * volumen)
+        pygame.draw.rect(p, GRIS if silenciado else XP_COLOR, lleno, border_radius=4)
+        perilla = (barra.left + barra.width * volumen, barra.centery)
+        pygame.draw.circle(p, BLANCO, perilla, 10 if activa else 8)
+        pygame.draw.circle(p, XP_COLOR, perilla, 10 if activa else 8, 2)
+        self.texto(p, "−", (barra.left - 16, barra.centery - 1), self.fuente, GRIS)
+        self.texto(p, "+", (barra.right + 16, barra.centery - 1), self.fuente, GRIS)
+
         controles = "WASD mover  ·  mouse apuntar  ·  P pausa  ·  M sonido  ·  ESC salir"
-        self.texto(p, controles, (cx, boton.bottom + 40), self.fuente_chica, GRIS)
+        self.texto(p, controles, (cx, barra.bottom + 34), self.fuente_chica, GRIS)
 
     def dibujar_mejoras(self, p):
         """Dibuja las tarjetas de mejora con el color de su rareza; la del mouse se resalta."""
@@ -1803,6 +1901,8 @@ def main():
     """Bucle principal: procesa eventos, actualiza el juego y dibuja todas las ventanas."""
     pygame.mixer.pre_init(22050, -16, 1, 512)  # audio liviano y con poca latencia
     pygame.init()
+    global ICONO
+    ICONO = cargar_icono()
     juego = Juego()
     reloj = pygame.time.Clock()
 
@@ -1827,6 +1927,14 @@ def main():
             elif juego.estado == "menu":
                 if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
                     juego.clic_menu()
+                elif e.type == pygame.MOUSEMOTION and juego.arrastrando_volumen:
+                    juego.mover_volumen()
+                elif e.type == pygame.MOUSEBUTTONUP and e.button == 1:
+                    juego.soltar_volumen()
+                elif e.type == pygame.MOUSEWHEEL:
+                    juego.ajustar_volumen(0.05 * e.y)
+                elif e.type == pygame.KEYDOWN and e.key in (pygame.K_LEFT, pygame.K_RIGHT):
+                    juego.ajustar_volumen(0.1 if e.key == pygame.K_RIGHT else -0.1)
                 elif e.type == pygame.KEYDOWN and e.key in (pygame.K_RETURN, pygame.K_SPACE):
                     juego.empezar_partida()
             elif juego.estado == "fin":
