@@ -3,7 +3,9 @@ Window Shooter: shooter top-down multiventana (pygame-ce).
 
 El escenario es TODO el monitor. Cada ventana del juego es un "agujero" por
 el que se ve una parte de ese escenario. Al principio hay una sola ventana;
-la mejora "Ventana extra" abre otra cerca de la ventana principal.
+cada jefe llega abriendo una ventana nueva cerca de la principal y aparece
+en ella. Cuando ya no entran más ventanas sin tocarse, las nuevas se
+superponen a las existentes, cubriendo la mayor parte posible del vacío.
 
 La nave, los enemigos y las balas se mueven libremente por todo el monitor,
 también por el vacío entre ventanas, donde son invisibles. Cuando la nave
@@ -13,16 +15,18 @@ disparar) a enemigos que se ven en otra ventana.
 
 El objetivo es sobrevivir el mayor tiempo posible: el contador de tiempo es el puntaje.
 Cada minuto aparece un jefe verde; mientras vive, el cronómetro se detiene y
-los enemigos dan 75% menos de experiencia. Desde el 5º jefe, lo acompañan
+los enemigos dan 75% menos de experiencia. Desde el 3er jefe, lo acompañan
 escoltas que lo orbitan. Después de derrotar al primer jefe, los enemigos
 también entran por arriba y por abajo de las ventanas.
 
 Enemigos:
     Normal, Rápido, Tanque  -> persiguen a la nave (algunos disparan)
     Kamikaze                -> al acercarse fija tu posición, acelera y explota
+                               (desde 3 ventanas; más frecuentes cuantas más haya)
     Divisor                 -> al morir se parte en 2 enemigos más chicos
     Francotirador           -> mantiene distancia, marca una línea y dispara rápido
-    Escolta                 -> orbita al jefe y absorbe muchas balas
+    Escolta                 -> orbita al jefe, tiene el doble de vida que él y frena
+                               todas las balas (no la atraviesan ni rebotan en ella)
     Élite (10%)             -> cualquier tipo común con aura dorada: más vida y experiencia
 
 Mejoras (al llenar la barra de experiencia se elige 1 de 3). Rarezas:
@@ -35,8 +39,6 @@ Mejoras (al llenar la barra de experiencia se elige 1 de 3). Rarezas:
     Raras:        Escudo, Rebote, Reacción en cadena, Velocidad +
     Legendarias:  Vida extra, Recarga de escudo,
                   División (solo si ya tenés Perforación y Rebote)
-    Ventana extra sube de rareza cada 2 veces que se elige
-    (común, rara, legendaria y, desde la 7ª, mítica para siempre).
 
 Controles:
     W A S D             -> mover la nave
@@ -65,7 +67,7 @@ FRAMES_SIN_FOCO = 10           # frames sin foco antes de pausar solo (evita fal
 
 TAM_PRINCIPAL = (480, 360)     # tamaño de la ventana principal
 TAM_EXTRA = (320, 240)         # tamaño de cada ventana extra
-VENTANAS_MAX = 9               # ventanas en total (principal + extras)
+VENTANAS_MAX = 16              # ventanas en total (principal + extras); después se superponen
 MARGEN_VENTANAS = 24           # separación mínima entre ventanas
 MARGEN_TITULO = 32             # alto aproximado de la barra de título de la principal
 MARGEN_INFERIOR = 60           # espacio reservado para la barra de tareas de Windows
@@ -115,6 +117,7 @@ RECARGA_ENEMIGA = (180, 260)   # frames entre disparos enemigos (rango al azar)
 
 KAMIKAZE_DISTANCIA = 170       # a esta distancia fija tu posición y se lanza
 KAMIKAZE_VENTANAS_MIN = 3      # ventanas abiertas (contando la principal) para que aparezcan
+KAMIKAZE_PESO_POR_VENTANA = 6  # peso extra de aparición por cada ventana por encima de ese mínimo
 KAMIKAZE_ROJO = (255, 25, 25)  # color del titileo
 KAMIKAZE_MECHA = 50           # frames desde que se lanza hasta que explota
 KAMIKAZE_VEL_MAX = 8
@@ -127,9 +130,12 @@ FRANCO_FIJA = 20               # ...los últimos, con la dirección ya fija (par
 FRANCO_VEL_BALA = 9
 FRANCO_RECARGA = (160, 240)
 
-ESCOLTAS_DESDE_JEFE = 5        # el jefe número 5 (minuto 5) y los siguientes traen escoltas
-ESCOLTAS_BASE = 3              # escoltas del 5º jefe; +1 por cada jefe siguiente...
+ESCOLTAS_DESDE_JEFE = 3        # el jefe número 3 (minuto 3) y los siguientes traen escoltas
+ESCOLTAS_BASE = 3              # escoltas del 3er jefe; +1 por cada jefe siguiente...
 ESCOLTAS_MAX = 6               # ...hasta este máximo
+ESCOLTAS_ORBITA = 14           # separación entre el borde del jefe y la primera órbita...
+ESCOLTAS_SEPARACION = 20       # ...y entre una órbita y la siguiente
+ESCOLTAS_VIDA = 2              # vida de cada escolta = esto x la vida del jefe
 
 ELITE_PROB = 0.10              # chance de que un enemigo común sea élite
 ELITE_VIDA = 3                 # multiplicador de vida de los élite
@@ -185,8 +191,6 @@ MEJORAS = {
                          rareza="comun", maximo=5),
     "critico":      dict(titulo="Crítico", desc="+10% de chance de hacer doble daño",
                          rareza="comun", maximo=5),
-    "ventana":      dict(titulo="Ventana extra", desc="Otra ventana cerca de la principal",
-                         rareza="comun"),  # su rareza real sube con el uso (ver Juego.rareza)
     "escudo":       dict(titulo="Escudo", desc="Para 1 golpe y explota: 3 de daño a todos",
                          rareza="rara"),
     "rebote":       dict(titulo="Rebote", desc="Tras impactar, la bala salta a otro enemigo",
@@ -1042,12 +1046,71 @@ class Juego:
         mejor = min(d for d, _ in candidatos)
         return random.choice([pos for d, pos in candidatos if d <= mejor + CERCANIA])
 
+    def posicion_superpuesta(self, tam):
+        """Cuando ya no hay lugar libre: el lugar donde una ventana tape MÁS vacío.
+
+        Divide el monitor en celdas, marca las que ya se ven en alguna
+        ventana y, con una suma acumulada, cuenta cuántas celdas vacías
+        cubriría cada posible ventana. Entre las que cubren casi tanto como la
+        mejor (90%), elige una cerca de la principal. Nunca tapa la ventana
+        principal (ahí están el HUD y las tarjetas). Devuelve None si ya no
+        queda vacío por cubrir.
+        """
+        area, celda = self.area_ventanas, PASO_GRILLA
+        columnas, filas = area.width // celda, area.height // celda
+        rects = [v.rect for v in self.vistas]
+        # acumulado[f][c] = celdas vacías en el rectángulo de filas < f y columnas < c
+        acumulado = [[0] * (columnas + 1) for _ in range(filas + 1)]
+        for f in range(filas):
+            fila_actual, fila_anterior = acumulado[f + 1], acumulado[f]
+            y = area.top + f * celda + celda // 2
+            suma = 0
+            for c in range(columnas):
+                x = area.left + c * celda + celda // 2
+                if not any(r.collidepoint(x, y) for r in rects):
+                    suma += 1
+                fila_actual[c + 1] = fila_anterior[c + 1] + suma
+
+        principal = self.principal.rect.inflate(MARGEN_VENTANAS * 2, MARGEN_VENTANAS * 2)
+        principal.top -= MARGEN_TITULO
+        principal.height += MARGEN_TITULO
+        ancho, alto = tam[0] // celda, tam[1] // celda
+        candidatos = []
+        for f in range(filas - alto + 1):
+            for c in range(columnas - ancho + 1):
+                r = pygame.Rect(area.left + c * celda, area.top + f * celda, *tam)
+                if r.colliderect(principal):
+                    continue
+                vacio = (acumulado[f + alto][c + ancho] - acumulado[f][c + ancho]
+                         - acumulado[f + alto][c] + acumulado[f][c])
+                if vacio:
+                    dx = max(principal.left - r.right, r.left - principal.right, 0)
+                    dy = max(principal.top - r.bottom, r.top - principal.bottom, 0)
+                    candidatos.append((vacio, math.hypot(dx, dy), r.topleft))
+        if not candidatos:
+            return None
+        mejor = max(v for v, _, _ in candidatos)
+        buenos = [(d, pos) for v, d, pos in candidatos if v >= mejor * 0.9]
+        cerca = min(d for d, _ in buenos)
+        return random.choice([pos for d, pos in buenos if d <= cerca + CERCANIA])
+
     def agregar_ventana(self):
-        """Abre una ventana extra en un lugar libre cerca de la principal (si hay lugar)."""
+        """Abre una ventana extra cerca de la principal y la devuelve (None si no se pudo).
+
+        Primero busca un lugar libre; si ya no entra ninguna sin tocar a otra,
+        se superpone para cubrir la mayor parte posible del vacío.
+        """
+        if len(self.vistas) >= VENTANAS_MAX:
+            return None
         pos = self.posicion_libre(TAM_EXTRA)
-        if pos is not None:
-            self.vistas.append(Vista(TITULO, TAM_EXTRA, pos, principal=False))
-            self.sonido.play("ventana_abre")
+        if pos is None:
+            pos = self.posicion_superpuesta(TAM_EXTRA)
+        if pos is None:
+            return None
+        vista = Vista(TITULO, TAM_EXTRA, pos, principal=False)
+        self.vistas.append(vista)
+        self.sonido.play("ventana_abre")
+        return vista
 
     def revisar_foco(self):
         """Pausa solo si el juego perdió el foco del teclado durante varios frames seguidos.
@@ -1076,13 +1139,7 @@ class Juego:
             self.revisar_subida_nivel()
 
     def rareza(self, mejora):
-        """Rareza actual de una mejora.
-
-        "Ventana extra" sube un escalón cada 2 veces que se elige y se queda
-        en mítica para siempre; las demás tienen rareza fija.
-        """
-        if mejora == "ventana":
-            return ORDEN_RAREZAS[min(self.niveles["ventana"] // 2, len(ORDEN_RAREZAS) - 1)]
+        """Rareza de una mejora."""
         return MEJORAS[mejora]["rareza"]
 
     def revisar_subida_nivel(self):
@@ -1120,8 +1177,6 @@ class Juego:
             return j.cadencia > CADENCIA_MINIMA
         if mejora == "multidisparo":
             return j.disparos < DISPAROS_MAX
-        if mejora == "ventana":  # también hace falta que quede lugar libre en el monitor
-            return len(self.vistas) < VENTANAS_MAX and self.posicion_libre(TAM_EXTRA) is not None
         if mejora == "vida":
             return j.vidas < VIDAS_MAX
         if mejora == "escudo":
@@ -1149,8 +1204,6 @@ class Juego:
             return f"{j.vidas} -> {j.vidas + 1} vidas"
         if mejora == "escudo":
             return f"{j.escudo} -> {j.escudo + 1} capas"
-        if mejora == "ventana":
-            return f"{len(self.vistas)} -> {len(self.vistas) + 1} ventanas"
         if mejora == "perforacion":
             return f"atraviesa {n} -> {n + 1}"
         if mejora == "critico":
@@ -1174,8 +1227,6 @@ class Juego:
             j.cadencia = max(CADENCIA_MINIMA, j.cadencia * FACTOR_CADENCIA)
         elif mejora == "multidisparo":
             j.disparos += 1
-        elif mejora == "ventana":
-            self.agregar_ventana()
         elif mejora == "vida":
             j.vidas = min(j.vidas + 1, VIDAS_MAX)
         elif mejora == "escudo":
@@ -1345,10 +1396,9 @@ class Juego:
         """
         if tipo is None:
             disponibles = [t for t, d in ENEMIGOS.items()
-                           if d["peso"] > 0 and self.tiempo >= d["desde"]
-                           and (t != "kamikaze" or len(self.vistas) >= KAMIKAZE_VENTANAS_MIN)]
+                           if self.peso_aparicion(t) > 0 and self.tiempo >= d["desde"]]
             tipo = random.choices(disponibles,
-                                  weights=[ENEMIGOS[t]["peso"] for t in disponibles])[0]
+                                  weights=[self.peso_aparicion(t) for t in disponibles])[0]
         datos = ENEMIGOS[tipo]
         if not datos["tirador"] or self.tiempo < TIRADORES_DESDE:
             prob_tirador = 0.0
@@ -1358,7 +1408,11 @@ class Juego:
         dispara = random.random() < prob_tirador
         elite = datos["elite"] and random.random() < ELITE_PROB
 
-        enemigo = Enemigo(tipo, self.posicion_entrada(datos["radio"]), self.fuerza(), dispara, elite)
+        # El jefe llega abriendo una ventana nueva y aparece en su centro
+        # (si ya no se pueden abrir más, entra por el borde como los demás)
+        nueva = self.agregar_ventana() if tipo == "jefe" else None
+        pos = nueva.rect.center if nueva else self.posicion_entrada(datos["radio"])
+        enemigo = Enemigo(tipo, pos, self.fuerza(), dispara, elite)
         enemigo.velocidad *= self.factor_velocidad()
         self.enemigos.append(enemigo)
         if elite:
@@ -1371,13 +1425,27 @@ class Juego:
                 self.sonido.play("escoltas")
         return enemigo
 
+    def peso_aparicion(self, tipo):
+        """Peso de un tipo en el sorteo de enemigos.
+
+        El kamikaze necesita al menos KAMIKAZE_VENTANAS_MIN ventanas, y cada
+        ventana de más lo hace más frecuente.
+        """
+        peso = ENEMIGOS[tipo]["peso"]
+        if tipo == "kamikaze":
+            extra = len(self.vistas) - KAMIKAZE_VENTANAS_MIN
+            return 0 if extra < 0 else peso + KAMIKAZE_PESO_POR_VENTANA * extra
+        return peso
+
     def generar_escoltas(self, jefe):
-        """Crea las escoltas del jefe: orbitan a distintas distancias, en sentidos alternados."""
+        """Crea las escoltas del jefe: orbitan pegadas a él, a distintas distancias y en
+        sentidos alternados. Cada una tiene el doble de vida que el jefe."""
         cantidad = min(ESCOLTAS_MAX, ESCOLTAS_BASE + self.jefes_aparecidos - ESCOLTAS_DESDE_JEFE)
         for i in range(cantidad):
             escolta = Enemigo("escolta", jefe.pos, self.fuerza(), False)
+            escolta.vida_max = escolta.vida = jefe.vida_max * ESCOLTAS_VIDA
             escolta.protege = jefe
-            escolta.orbita = jefe.radio + 30 + i * 26
+            escolta.orbita = jefe.radio + ESCOLTAS_ORBITA + i * ESCOLTAS_SEPARACION
             escolta.angulo = 2 * math.pi * i / cantidad
             escolta.giro = (0.03 - i * 0.003) * (1 if i % 2 == 0 else -1)
             escolta.pos = jefe.pos + pygame.Vector2(escolta.orbita, 0).rotate_rad(escolta.angulo)
@@ -1477,6 +1545,8 @@ class Juego:
         elif danio == 1:
             self.sonido.play("impacto")
         b.golpeados.add(e)
+        if e.tipo == "escolta":
+            return False  # esponja de balas: frena la bala (sin perforar, rebotar ni dividirse)
 
         # División: si la bala mató, las nuevas balas recuperan todas sus divisiones
         if b.divisiones > 0 and len(self.balas) < MAX_BALAS:
